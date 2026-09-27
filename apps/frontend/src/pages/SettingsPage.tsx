@@ -207,12 +207,13 @@ function SendersCard() {
           {(senders.data ?? []).length === 0 && <li className="px-4 py-6 text-center text-muted">No senders yet.</li>}
           {(senders.data ?? []).map((s) => (
             <li key={s.id} className="flex flex-wrap items-center gap-3 px-4 py-3">
-              <div className="min-w-0 flex-1">
+              {/* Full width on phones, so the actions wrap below instead of overlapping. */}
+              <div className="min-w-0 basis-full sm:basis-0 sm:flex-1">
                 <p className="truncate font-medium text-ink">
                   {s.displayName ? `${s.displayName} · ` : ''}
                   {s.email}
                 </p>
-                <p className="text-[12px] text-muted">
+                <p className="truncate text-[12px] text-muted">
                   {s.smtpHost}:{s.smtpPort} · {s.hourlyLimit}/hour {s.isActive ? '' : '· inactive'}
                 </p>
               </div>

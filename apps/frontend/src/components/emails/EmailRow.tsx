@@ -17,6 +17,12 @@ export function EmailRow({ email, mode }: { email: EmailListItem; mode: 'schedul
           <span className="text-ink-2">To: </span>
           {email.recipientEmail}
         </span>
+        {/* Phones: the sent time sits next to the status (the wide layout shows it at the end). */}
+        {time && (
+          <time dateTime={time} className="shrink-0 text-[11px] text-muted tabular-nums sm:hidden">
+            {formatShort(time)}
+          </time>
+        )}
         <StatusPill status={email.status} scheduledAt={email.scheduledAt} />
         <span className="min-w-0 basis-full truncate sm:basis-auto sm:flex-1">
           <span className="font-semibold text-ink">{email.subject}</span>

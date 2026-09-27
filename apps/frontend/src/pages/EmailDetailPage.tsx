@@ -20,7 +20,7 @@ function Meta({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="flex gap-3 py-1.5">
       <dt className="w-36 shrink-0 text-muted">{label}</dt>
-      <dd className="min-w-0 flex-1 text-ink-2">{children}</dd>
+      <dd className="min-w-0 flex-1 text-ink-2 [overflow-wrap:anywhere]">{children}</dd>
     </div>
   );
 }

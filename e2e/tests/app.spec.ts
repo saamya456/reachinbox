@@ -135,8 +135,12 @@ test.describe.serial('@before-restart', () => {
   test('scheduled view, queue dashboard, real delivery, rate limit and search', async ({ page, context }) => {
     await signIn(context);
     const { firstCampaign, runId } = readState();
-    await page.goto('/scheduled');
-    await expect(page.getByRole('link', { name: /E2E launch/ }).first()).toBeVisible({ timeout: 20_000 });
+    // Search is near-real-time (Elasticsearch refreshes every second), and a
+    // freshly opened page fetches once, so reload until the new rows show up.
+    await expect(async () => {
+      await page.goto('/scheduled');
+      await expect(page.getByRole('link', { name: /E2E launch/ }).first()).toBeVisible({ timeout: 3_000 });
+    }).toPass({ timeout: 20_000 });
     await shot(page, '06-scheduled');
 
     const queues = (await (await page.request.get('/api/admin/queues')).json()) as { queues: { name: string; counts: Record<string, number> }[] };
@@ -168,8 +172,10 @@ test.describe.serial('@before-restart', () => {
       expect((await page.request.get(e.previewUrl!)).status()).toBe(200);
     }
 
-    await page.goto('/sent');
-    await expect(page.getByRole('link', { name: new RegExp(`E2E launch ${runId}`) })).toHaveCount(5, { timeout: 20_000 });
+    await expect(async () => {
+      await page.goto('/sent');
+      await expect(page.getByRole('link', { name: new RegExp(`E2E launch ${runId}`) })).toHaveCount(5, { timeout: 3_000 });
+    }).toPass({ timeout: 20_000 });
     await shot(page, '08-sent');
     // Search narrows the list to that recipient (other runs may have mailed it too).
     await page.getByRole('searchbox', { name: /Search sent emails/ }).fill('lead.three');

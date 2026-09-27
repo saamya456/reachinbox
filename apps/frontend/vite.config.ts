@@ -15,6 +15,7 @@ export default defineConfig({
   envDir: '../../',
   server: {
     port: 5173,
+    allowedHosts: ['.ngrok-free.app'],
     proxy: {
       '/api': backend,
       '/auth': backend,
