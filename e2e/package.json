@@ -1,0 +1,15 @@
+{
+  "name": "@reachinbox/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser end-to-end checks against the locally running stack (see README).",
+  "scripts": {
+    "install-browser": "playwright install chromium",
+    "test": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
+  }
+}

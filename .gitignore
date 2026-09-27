@@ -1,0 +1,39 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+build/
+*.tsbuildinfo
+
+# generated
+apps/backend/src/generated/
+
+# env
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+# editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# e2e artifacts
+e2e/test-results/
+e2e/playwright-report/
+e2e/.state.json
+e2e/screens/
+
+# test coverage
+coverage/
+
+# key material
+*.pem
+*.key

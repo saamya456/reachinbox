@@ -1,0 +1,232 @@
+// Prisma schema for the ReachInbox backend.
+//
+// Tenancy: every tenant-owned row carries `userId`. Emails reference their
+// campaign and sender through composite (id, userId) foreign keys, so the
+// database itself rejects an email that points at another user's campaign or
+// sender.
+//
+// Secrets: SMTP passwords and Slack tokens are stored only as ciphertext
+// (`*Encrypted` columns, AES-256-GCM via src/lib/crypto.ts). API responses must
+// use the safe selects in src/db/selects.ts, which omit these columns.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum EmailStatus {
+  SCHEDULED // waiting for its scheduledAt (also used after a rate-limit reschedule)
+  PROCESSING // claimed by a worker (processing_token set), send in progress
+  SENT
+  FAILED // definitively not delivered
+  CANCELLED
+  // A delivery attempt started (delivery_started_at set) but its outcome was
+  // never recorded, e.g. the worker crashed between SMTP acceptance and the
+  // SENT write. Never retried automatically: resending could duplicate it.
+  DELIVERY_UNKNOWN
+}
+
+enum SlackConnectionStatus {
+  ACTIVE
+  REVOKED
+  ERROR
+}
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  googleId  String   @unique @map("google_id")
+  email     String   @unique
+  name      String?
+  avatarUrl String?  @map("avatar_url")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  senders          Sender[]
+  campaigns        Campaign[]
+  emails           Email[]
+  slackConnections SlackConnection[]
+
+  @@map("users")
+}
+
+model Sender {
+  id                    String   @id @default(uuid()) @db.Uuid
+  userId                String   @map("user_id") @db.Uuid
+  email                 String
+  displayName           String?  @map("display_name")
+  smtpHost              String   @map("smtp_host")
+  smtpPort              Int      @map("smtp_port")
+  smtpSecure            Boolean  @default(false) @map("smtp_secure")
+  smtpUser              String   @map("smtp_user")
+  smtpPasswordEncrypted String   @map("smtp_password_encrypted")
+  isActive              Boolean  @default(true) @map("is_active")
+  hourlyLimit           Int      @map("hourly_limit")
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  emails    Email[]
+  campaigns Campaign[]
+
+  // Target for the tenant-safe composite FK from Email.
+  @@unique([id, userId])
+  @@unique([userId, email])
+  // Pick active senders for a user when distributing a campaign.
+  @@index([userId, isActive])
+  @@map("senders")
+}
+
+model Campaign {
+  id                   String         @id @default(uuid()) @db.Uuid
+  userId               String         @map("user_id") @db.Uuid
+  subject              String
+  body                 String
+  startAt              DateTime       @map("start_at") @db.Timestamptz(3)
+  delayBetweenEmailsMs Int            @map("delay_between_emails_ms")
+  hourlyLimit          Int            @map("hourly_limit")
+  status               CampaignStatus @default(SCHEDULED)
+  totalEmails          Int            @default(0) @map("total_emails")
+  // Sender chosen in compose (every email of the campaign uses it).
+  senderId             String?        @map("sender_id") @db.Uuid
+  // IANA timezone the user scheduled in (display only; startAt is UTC).
+  timezone             String?
+  // Client-generated id per compose submission: a retried/double-submitted
+  // request returns the existing campaign instead of creating a second one.
+  clientRequestId      String?        @map("client_request_id")
+  createdAt            DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sender Sender? @relation(fields: [senderId, userId], references: [id, userId], onDelete: Restrict)
+  emails Email[]
+
+  // Target for the tenant-safe composite FK from Email.
+  @@unique([id, userId])
+  @@unique([userId, clientRequestId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, status])
+  @@index([status, startAt])
+  @@map("campaigns")
+}
+
+model Email {
+  id             String      @id @default(uuid()) @db.Uuid
+  userId         String      @map("user_id") @db.Uuid
+  campaignId     String      @map("campaign_id") @db.Uuid
+  senderId       String      @map("sender_id") @db.Uuid
+  recipientEmail String      @map("recipient_email")
+  // Snapshot of the campaign content at scheduling time, so a worker can send
+  // without reading the campaign and edits to it don't alter queued emails.
+  subject        String
+  body           String
+  status         EmailStatus @default(SCHEDULED)
+
+  // Scheduling. `scheduledAt` is the current target send time and moves on a
+  // rate-limit reschedule; `originalScheduledAt` never changes.
+  scheduledAt         DateTime  @map("scheduled_at") @db.Timestamptz(3)
+  originalScheduledAt DateTime  @map("original_scheduled_at") @db.Timestamptz(3)
+  rescheduleCount     Int       @default(0) @map("reschedule_count")
+  lastRescheduledAt   DateTime? @map("last_rescheduled_at") @db.Timestamptz(3)
+
+  // Delivery.
+  attempts          Int       @default(0)
+  lastAttemptAt     DateTime? @map("last_attempt_at") @db.Timestamptz(3)
+  // Crash-recovery markers. Each claim gets a fresh token; every later write
+  // for that attempt is conditional on it, so a superseded claimant cannot
+  // overwrite the row. deliveryStartedAt is written immediately before the
+  // email is handed to the provider: null => provably not sent (safe to
+  // release), set => outcome ambiguous (DELIVERY_UNKNOWN on recovery).
+  processingToken   String?   @map("processing_token") @db.Uuid
+  deliveryStartedAt DateTime? @map("delivery_started_at") @db.Timestamptz(3)
+  sentAt            DateTime? @map("sent_at") @db.Timestamptz(3)
+  providerMessageId String?   @map("provider_message_id")
+  previewUrl        String?   @map("preview_url") // Ethereal message preview
+  errorCode         String?   @map("error_code")
+  errorMessage      String?   @map("error_message")
+
+  // Guards against double-sends when a job is retried or enqueued twice.
+  idempotencyKey String @unique @map("idempotency_key")
+
+  // Incremented by a database trigger whenever a searchable field changes;
+  // used as the Elasticsearch external document version so an older state
+  // can never overwrite a newer one in the index. Not written by the app.
+  searchVersion BigInt @default(1) @map("search_version")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaign Campaign @relation(fields: [campaignId, userId], references: [id, userId], onDelete: Cascade)
+  // Restrict: senders with email history should be deactivated, not deleted.
+  sender   Sender   @relation(fields: [senderId, userId], references: [id, userId], onDelete: Restrict)
+
+  // Due-email scans (startup recovery / enqueueing).
+  @@index([status, scheduledAt])
+  // Per-user dashboard lists: scheduled (by scheduledAt) and sent (by sentAt).
+  @@index([userId, status, scheduledAt])
+  @@index([userId, sentAt(sort: Desc)])
+  // Campaign progress counts.
+  @@index([campaignId, status])
+  // Per-sender hourly usage (sent in the last hour) and finding the next free
+  // slot when rescheduling a rate-limited sender.
+  @@index([senderId, sentAt])
+  @@index([senderId, status, scheduledAt])
+  @@map("emails")
+}
+
+// Transactional outbox for the Elasticsearch email index. Rows are written by
+// database triggers on `emails` in the same transaction as the change, and
+// deleted only after Elasticsearch has applied them. No foreign key: a row
+// must survive the deletion of its email so the deletion reaches the index.
+model SearchOutbox {
+  id        BigInt   @id @default(autoincrement())
+  emailId   String   @map("email_id") @db.Uuid
+  // Version to apply (for deletions: one above the last indexed version).
+  version   BigInt
+  deleted   Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([emailId])
+  @@map("search_outbox")
+}
+
+model SlackConnection {
+  id                   String                @id @default(uuid()) @db.Uuid
+  userId               String                @map("user_id") @db.Uuid
+  teamId               String                @map("team_id")
+  teamName             String?               @map("team_name")
+  channelId            String?               @map("channel_id")
+  channelName          String?               @map("channel_name")
+  botUserId            String?               @map("bot_user_id")
+  scope                String?
+  accessTokenEncrypted String                @map("access_token_encrypted")
+  // Incoming-webhook URL for the channel chosen during Slack OAuth. It is a
+  // bearer credential (anyone holding it can post), so it is encrypted too.
+  webhookUrlEncrypted  String?               @map("webhook_url_encrypted")
+  status               SlackConnectionStatus @default(ACTIVE)
+  // Why the connection left ACTIVE (e.g. Slack reported the token revoked).
+  lastError            String?               @map("last_error")
+  lastNotifiedAt       DateTime?             @map("last_notified_at") @db.Timestamptz(3)
+  createdAt            DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, teamId])
+  @@index([userId, status])
+  @@map("slack_connections")
+}
