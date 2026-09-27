@@ -48,7 +48,7 @@ docker-compose.yml   PostgreSQL 16, Redis 7 (AOF), Elasticsearch 8.15
 | Minimum delay between sends | `MIN_SEND_DELAY_MS` (default **2 s**) or the campaign's delay if larger, enforced per sender across all workers (Redis Lua gate) |
 | Emails per hour, configurable, multi-worker safe | Per sender (`sender.hourly_limit`, capped by `MAX_EMAILS_PER_HOUR_PER_SENDER`) and per campaign (compose "Hourly Limit"); atomic Redis counters keyed by hour window + sender |
 | Limit reached → reschedule, keep order | Same job re-delayed into the next window with increasing slots; `reschedule_count` recorded |
-| Slack notification on rate-limit hit | Slack OAuth; webhook message once per sender/window; disconnect/reconnect without redeploy |
+| Slack notification on rate-limit hit | Slack OAuth (channel picked on Slack's consent screen); webhook message once per sender/window; disconnect/reconnect without redeploy; verified live with a real Slack workspace |
 | Behaviour under load (1000+) | Tested: 1000 simultaneous emails and 1500-recipient campaigns |
 | **Frontend** | |
 | Real Google OAuth login | "Login with Google" → backend OpenID Connect flow (PKCE, nonce, state) → HttpOnly session |
@@ -112,6 +112,56 @@ Sent emails never reach real inboxes; open an email and click **Ethereal preview
 | Elasticsearch 8.15 | 9200 | single node, security disabled (dev only), 512 MB heap, 1.5 GB limit; volume `elasticsearch_data` |
 
 `npm run infra:down` stops the containers (data is kept in volumes); `docker compose down -v` also deletes the data.
+
+### Real Google and Slack OAuth over HTTPS (ngrok)
+
+Google accepts `http://localhost` redirect URIs, so Google sign-in works locally as is. Slack requires an **HTTPS** redirect URL, so the Slack connection needs a tunnel. Tunnel the **frontend** (Vite), not the API. Vite serves the app and proxies `/api`, `/auth`, `/slack` and `/admin` to the API, so the UI, the API and both OAuth callbacks share one HTTPS origin. That matters because the Slack callback only accepts the session that started the connection, and a session cookie set on `localhost` is not sent to the tunnel host.
+
+1. Start the stack as above, then `ngrok http 5173`. `vite.config.ts` already allows `*.ngrok-free.app` hosts (`server.allowedHosts`).
+2. Point these at the tunnel URL in `.env` (e.g. `https://<id>.ngrok-free.app`):
+   ```
+   APP_URL=https://<id>.ngrok-free.app
+   CORS_ORIGIN=https://<id>.ngrok-free.app
+   GOOGLE_CALLBACK_URL=https://<id>.ngrok-free.app/auth/google/callback
+   SLACK_REDIRECT_URI=https://<id>.ngrok-free.app/slack/callback
+   ```
+3. Register the same two callback URLs: Google Cloud Console → your OAuth client → *Authorized redirect URIs*; Slack app → *OAuth & Permissions* → *Redirect URLs* (scope `incoming-webhook`).
+4. Restart the API and the worker (they read `.env` only at startup).
+5. Open the tunnel URL, sign in with Google **there**, then **Settings → Connect Slack**, pick a channel and allow.
+
+Notes:
+- A free ngrok URL changes whenever ngrok restarts; repeat steps 2–4 with the new URL.
+- If ngrok cannot reach Vite (Vite may listen on the IPv6 loopback only), start Vite on IPv4: `cd apps/frontend && npx vite --host 127.0.0.1`.
+- Once Slack is connected, notifications are outbound calls and need no tunnel. You can switch the URLs back to localhost; the connection is stored per user.
+
+## Demo walkthrough
+
+A 5-minute path through the assignment's demo points. Before recording: the stack is running, your Google email is in `ADMIN_EMAILS` (for Bull Board), and Slack is connected (see above).
+
+1. **Login:** open the app and click **Login with Google**. You land on the dashboard, with your name, email and avatar in the sidebar and top bar.
+2. **Sender:** **Settings → New Ethereal sender**. The Slack card shows the connected workspace and channel.
+3. **Schedule under a limit:** **Compose**:
+   - pick the sender;
+   - add a few addresses as chips and **Upload List** with a CSV (the detected, invalid and duplicate counts are shown);
+   - enter a subject and body;
+   - set **Delay between 2 emails** to `3` and **Hourly Limit** to `3`;
+   - **Send Later → Now**.
+4. **Dashboard:**
+   - **Scheduled** lists the emails;
+   - **Sent** fills 3 s apart (the minimum delay);
+   - open one → **Ethereal preview → Open message**;
+   - the emails over the limit stay in **Scheduled** marked *Rescheduled* (next hour, not dropped);
+   - the Slack channel receives **"Hourly sending limit reached"**.
+5. **Queues and search:**
+   - `/admin/queues` (Bull Board) shows the delayed jobs of the rescheduled emails;
+   - in **Sent**, search for a recipient or subject.
+6. **Restart:**
+   - compose another campaign with **Send Later** 2–3 minutes ahead;
+   - stop the API and the worker (Ctrl+C in both terminals), then start them again;
+   - the worker logs `startup reconciliation finished … "alreadyScheduled": N`;
+   - at the chosen time the emails are sent, once each.
+7. **Cancel (optional):** open a still-scheduled email → **Cancel this campaign** → confirm.
+8. **Behaviour under load (bonus):** `npm test -w apps/backend` includes test **V**: 1000 emails at once across 3 workers under an hourly limit and a minimum delay (exact counts sent/rescheduled, no duplicates).
 
 ## Testing
 
@@ -191,7 +241,8 @@ React 19 + React Router + Tailwind CSS, following the Figma frames:
 
 ## Known assumptions and trade-offs
 
-- **Real providers not verified:** Google and Slack OAuth were exercised against protocol-faithful local stand-ins in the tests, not against the real providers (no credentials were available). The Slack "live message" therefore needs your Slack app credentials to demonstrate.
+- **Real providers:** Google sign-in and the Slack OAuth connection (workspace and channel chosen on Slack's consent screen) were verified against the real Google and Slack services through an ngrok HTTPS tunnel. Hourly-limit notifications were accepted by the real Slack webhook. The automated tests use protocol-faithful local stand-ins for both providers, so they run without credentials.
+- **Dev tunnel host:** the Vite dev server allows `*.ngrok-free.app` hosts (`server.allowedHosts`) for the HTTPS OAuth setup. This affects only the development server, not the production build.
 - **At-most-once delivery:** if an SMTP interaction may have been accepted but its result was lost, the email becomes `DELIVERY_UNKNOWN` and is never retried (shown as "Unknown", not "Sent").
 - **Rate limits:** clock-hour windows can allow up to 2× the limit across a window boundary. The minimum delay applies per sender.
 - **Ordering:** exact with concurrency 1; with concurrency > 1, emails due at the same moment can be reordered by up to concurrency × workers.
@@ -279,7 +330,7 @@ Trade-off: SMTP servers on private networks (e.g. a local MailHog) cannot be use
 | Variable | Purpose |
 |---|---|
 | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` | From your Slack app (api.slack.com/apps → Basic Information). If unset, `/slack/connect` returns 503. |
-| `SLACK_REDIRECT_URI` | Default `http://localhost:4000/slack/callback`. Add it under *OAuth & Permissions → Redirect URLs*. Slack requires HTTPS redirect URLs, so in development expose the backend through an HTTPS tunnel and set this variable to the tunnel URL. |
+| `SLACK_REDIRECT_URI` | Default `http://localhost:4000/slack/callback`. Add it under *OAuth & Permissions → Redirect URLs*. Slack requires HTTPS redirect URLs, so in development tunnel the **frontend** and set this to `https://<tunnel>/slack/callback` (see "Real Google and Slack OAuth over HTTPS"). |
 
 The Slack app needs one scope: **`incoming-webhook`**.
 
